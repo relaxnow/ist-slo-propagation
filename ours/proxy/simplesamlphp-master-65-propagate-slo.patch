@@ -1,0 +1,382 @@
+diff --git a/lib/SimpleSAML/Auth/Default.php b/lib/SimpleSAML/Auth/Default.php
+index ca02e74..5198658 100644
+--- a/lib/SimpleSAML/Auth/Default.php
++++ b/lib/SimpleSAML/Auth/Default.php
+@@ -44,6 +44,7 @@ class SimpleSAML_Auth_Default {
+ 			'SimpleSAML_Auth_Default.ErrorURL' => $errorURL,
+ 			'LoginCompletedHandler' => array(get_class(), 'loginCompleted'),
+ 			'LogoutCallback' => array(get_class(), 'logoutCallback'),
++			'LogoutAssociationsCallback' => array(get_class(), 'logoutAssociationsCallback'),
+ 			'LogoutCallbackState' => array(
+ 				'SimpleSAML_Auth_Default.logoutSource' => $authId,
+ 			),
+@@ -250,6 +251,31 @@ class SimpleSAML_Auth_Default {
+ 
+ 
+ 	/**
++	 * Called when the authentication source receives an external logout request.
++	 *
++	 * @param array $state  State array for the logout operation.
++	 */
++	public static function logoutAssociationsCallback($state) {
++		assert('is_array($state)');
++		assert('array_key_exists("SimpleSAML_Auth_Default.logoutSource", $state)');
++
++		$source = $state['SimpleSAML_Auth_Default.logoutSource'];
++
++		$session = SimpleSAML_Session::getInstance();
++		$authId = $session->getAuthority();
++
++		if ($authId !== $source) {
++			SimpleSAML_Logger::warning('Received logout from different authentication source ' .
++				'than the current. Current is ' . var_export($authId, TRUE) .
++				'. Logout source is ' . var_export($source, TRUE) . '.');
++			return array();
++		}
++
++		return $session->getAllAssociations();
++	}
++
++
++	/**
+ 	 * Handle a unsolicited login operations.
+ 	 *
+ 	 * This function creates a session from the received information. It
+diff --git a/lib/SimpleSAML/Auth/Source.php b/lib/SimpleSAML/Auth/Source.php
+index 802035e..34a0b00 100644
+--- a/lib/SimpleSAML/Auth/Source.php
++++ b/lib/SimpleSAML/Auth/Source.php
+@@ -297,6 +297,14 @@ abstract class SimpleSAML_Auth_Source {
+ 		$session = SimpleSAML_Session::getInstance();
+ 		$session->setData('SimpleSAML_Auth_Source.LogoutCallbacks', $id, $data,
+ 			SimpleSAML_Session::DATA_TIMEOUT_LOGOUT);
++
++		if (!array_key_exists('LogoutAssociationsCallback', $state)) {
++			return;
++		}
++
++		$session->setData('SimpleSAML_Auth_Source.LogoutAssociationsCallbacks', $id, array(
++			'callback' => $state['LogoutAssociationsCallback'],
++			'state'	=> $callbackState));
+ 	}
+ 
+ 
+@@ -332,7 +340,7 @@ abstract class SimpleSAML_Auth_Source {
+ 		$callback = $data['callback'];
+ 		$callbackState = $data['state'];
+ 
+-		call_user_func($callback, $callbackState);
++		return call_user_func($callback, $callbackState);
+ 	}
+ 
+ 
+diff --git a/lib/SimpleSAML/Session.php b/lib/SimpleSAML/Session.php
+index bf0b8e0..82cf772 100644
+--- a/lib/SimpleSAML/Session.php
++++ b/lib/SimpleSAML/Session.php
+@@ -1237,6 +1237,16 @@ class SimpleSAML_Session {
+ 	}
+ 
+ 
++	public function getAllAssociations()
++	{
++		if (!isset($this->associations)) {
++			$this->associations = array();
++		}
++
++		return $this->associations;
++	}
++
++
+ 	/**
+ 	 * Remove an SP association for an IdP.
+ 	 *
+diff --git a/modules/saml/lib/Auth/Source/SP.php b/modules/saml/lib/Auth/Source/SP.php
+index a2b2235..09a8b58 100644
+--- a/modules/saml/lib/Auth/Source/SP.php
++++ b/modules/saml/lib/Auth/Source/SP.php
+@@ -522,6 +522,30 @@ class sspmod_saml_Auth_Source_SP extends SimpleSAML_Auth_Source {
+ 	}
+ 
+ 
++	public function getLogoutAssociations($idpEntityId)
++	{
++		assert('is_string($assoc)');
++
++		$id = strlen($this->authId) . ':' . $this->authId . $idpEntityId;
++
++		$session = SimpleSAML_Session::getInstance();
++
++		$data = $session->getData('SimpleSAML_Auth_Source.LogoutAssociationsCallbacks', $id);
++		if ($data === NULL) {
++			return array();
++		}
++
++		assert('is_array($data)');
++		assert('array_key_exists("callback", $data)');
++		assert('array_key_exists("state", $data)');
++
++		$callback 		= $data['callback'];
++		$callbackState 	= $data['state'];
++
++		return call_user_func($callback, $callbackState);
++	}
++
++
+ 	/**
+ 	 * Called when we have completed the procssing chain.
+ 	 *
+diff --git a/modules/saml/lib/SP/LogoutStore.php b/modules/saml/lib/SP/LogoutStore.php
+index 93bef89..b700672 100644
+--- a/modules/saml/lib/SP/LogoutStore.php
++++ b/modules/saml/lib/SP/LogoutStore.php
+@@ -198,6 +198,40 @@ class sspmod_saml_SP_LogoutStore {
+ 	}
+ 
+ 
++	public static function canLogoutSessions() {
++		return SimpleSAML_Store::getInstance() !== FALSE;
++	}
++
++
++	public static function getSessionAssociations($authId, array $nameId, array $sessionIndexes) {
++		$associations = array();
++
++		self::foreachSessionIndex(
++			$authId,
++			$nameId,
++			$sessionIndexes,
++			function ($sessions, $sessionIndex) use (&$associations, $authId) {
++				if (!isset($sessions[$sessionIndex])) {
++					return;
++				}
++
++				$sessionId = $sessions[$sessionIndex];
++
++				$session = SimpleSAML_Session::getSession($sessionId);
++				if ($session === NULL) {
++					return;
++				}
++
++				if (!$session->isValid($authId)) {
++					return;
++				}
++
++				$associations = array_merge_recursive($associations, $session->getAllAssociations());
++			}
++		);
++		return $associations;
++	}
++
+ 	/**
+ 	 * Log out of the given sessions.
+ 	 *
+@@ -207,6 +241,47 @@ class sspmod_saml_SP_LogoutStore {
+ 	 * @returns int|FALSE  Number of sessions logged out, or FALSE if not supported.
+ 	 */
+ 	public static function logoutSessions($authId, array $nameId, array $sessionIndexes) {
++		$numLoggedOut = 0;
++		self::foreachSessionIndex(
++			$authId,
++			$nameId,
++			$sessionIndexes,
++			function ($sessions, $sessionIndex) use ($authId, &$numLoggedOut) {
++				$numLoggedOut += sspmod_saml_SP_LogoutStore::logoutSession($authId, $sessions, $sessionIndex);
++			}
++		);
++		return $numLoggedOut;
++	}
++
++
++	protected static function logoutSession($authId, $sessions, $sessionIndex)
++	{
++		if (!isset($sessions[$sessionIndex])) {
++			SimpleSAML_Logger::info('saml.LogoutStore: Logout requested for unknown SessionIndex.');
++			return 0;
++		}
++
++		$sessionId = $sessions[$sessionIndex];
++
++		$session = SimpleSAML_Session::getSession($sessionId);
++		if ($session === NULL) {
++			SimpleSAML_Logger::info('saml.LogoutStore: Skipping logout of missing session.');
++			return 0;
++		}
++
++		if (!$session->isValid($authId)) {
++			SimpleSAML_Logger::info('saml.LogoutStore: Skipping logout of session because it isn\'t authenticated.');
++			return 0;
++		}
++
++		SimpleSAML_Logger::info('saml.LogoutStore: Logging out of session with trackId [' . $session->getTrackID() . '].');
++		$session->doLogout($authId);
++		return 1;
++	}
++
++
++
++	protected static function foreachSessionIndex($authId, array $nameId, array $sessionIndexes, $callback) {
+ 		assert('is_string($authId)');
+ 
+ 		$store = SimpleSAML_Store::getInstance();
+@@ -243,34 +318,12 @@ class sspmod_saml_SP_LogoutStore {
+ 			$sessionIndexes = array_keys($sessions);
+ 		}
+ 
+-		$sessionHandler = SimpleSAML_SessionHandler::getSessionHandler();
++		SimpleSAML_SessionHandler::getSessionHandler();
+ 
+-		$numLoggedOut = 0;
+ 		foreach ($sessionIndexes as $sessionIndex) {
+-			if (!isset($sessions[$sessionIndex])) {
+-				SimpleSAML_Logger::info('saml.LogoutStore: Logout requested for unknown SessionIndex.');
+-				continue;
+-			}
+-
+-			$sessionId = $sessions[$sessionIndex];
+-
+-			$session = SimpleSAML_Session::getSession($sessionId);
+-			if ($session === NULL) {
+-				SimpleSAML_Logger::info('saml.LogoutStore: Skipping logout of missing session.');
+-				continue;
+-			}
+-
+-			if (!$session->isValid($authId)) {
+-				SimpleSAML_Logger::info('saml.LogoutStore: Skipping logout of session because it isn\'t authenticated.');
+-				continue;
+-			}
+-
+-			SimpleSAML_Logger::info('saml.LogoutStore: Logging out of session with trackId [' . $session->getTrackID() . '].');
+-			$session->doLogout($authId);
+-			$numLoggedOut += 1;
++			$callback($sessionIndex, $sessions);
+ 		}
+-
+-		return $numLoggedOut;
++		return true;
+ 	}
+ 
+ }
+diff --git a/modules/saml/www/sp/saml2-logout-resume.php b/modules/saml/www/sp/saml2-logout-resume.php
+index e69de29..b69810a 100644
+--- a/modules/saml/www/sp/saml2-logout-resume.php
++++ b/modules/saml/www/sp/saml2-logout-resume.php
+@@ -0,0 +1,66 @@
++<?php
++
++if (!isset($_REQUEST['id'])) {
++	throw new SimpleSAML_Error_BadRequest('Missing id-parameter.');
++}
++$id = (string)$_REQUEST['id'];
++
++// sanitize the input
++$sid = SimpleSAML_Utilities::parseStateID($id);
++if (!is_null($sid['url'])) {
++	SimpleSAML_Utilities::checkURLAllowed($sid['url']);
++}
++
++$state = SimpleSAML_Auth_State::loadState($id, 'saml:LogoutAssociations');
++$idpAssociations = &$state['saml:LogoutAssociations:remaining'];
++
++if (!empty($idpAssociations)) {
++	$idpId = array_shift($idpAssociations);
++
++	$id = SimpleSAML_Auth_State::saveState($state, 'saml:LogoutAssociations');
++	$url = SimpleSAML_Module::getModuleURL('saml/sp/saml2-logout-resume.php', array('id' => $id));
++
++	$idp = SimpleSAML_IdP::getById($idpId);
++	return $idp->doLogoutRedirect($url);
++}
++
++/** @var sspmod_saml_Auth_Source_SP $source */
++$source = $state['saml:LogoutAssociations:authSource'];
++/** @var SAML2_LogoutRequest $message */
++$message = $state['saml:LogoutAssociations:logoutRequest'];
++/** @var SimpleSAML_Configuration $spMetadata */
++$spMetadata = $state['saml:LogoutAssociations:spMetadata'];
++/** @var SimpleSAML_Configuration $idpMetadata */
++$idpMetadata = $state['saml:LogoutAssociations:idpMetadata'];
++
++$sessionIndexes = $message->getSessionIndexes();
++$numLoggedOut = sspmod_saml_SP_LogoutStore::logoutSessions($source->getAuthId(), $message->getNameId(), $sessionIndexes);
++if ($numLoggedOut === FALSE) {
++	/* This type of logout was unsupported. Use the old method. */
++	$source->handleLogout($message->getIssuer());
++	$numLoggedOut = count($sessionIndexes);
++}
++
++/* Create an send response. */
++$lr = sspmod_saml_Message::buildLogoutResponse($spMetadata, $idpMetadata);
++$lr->setRelayState($message->getRelayState());
++$lr->setInResponseTo($message->getId());
++
++if ($numLoggedOut < count($sessionIndexes)) {
++	SimpleSAML_Logger::warning('Logged out of ' . $numLoggedOut  . ' of ' . count($sessionIndexes) . ' sessions.');
++}
++
++$dst = $idpMetadata->getEndpointPrioritizedByBinding('SingleLogoutService', array(
++		SAML2_Const::BINDING_HTTP_REDIRECT,
++		SAML2_Const::BINDING_HTTP_POST)
++);
++
++$binding = SAML2_Binding::getBinding($dst['Binding']);
++if (isset($dst['ResponseLocation'])) {
++	$dst = $dst['ResponseLocation'];
++} else {
++	$dst = $dst['Location'];
++}
++$binding->setDestination($dst);
++
++$binding->send($lr);
+\ No newline at end of file
+diff --git a/modules/saml/www/sp/saml2-logout.php b/modules/saml/www/sp/saml2-logout.php
+index 950f3b0..6264ecf 100644
+--- a/modules/saml/www/sp/saml2-logout.php
++++ b/modules/saml/www/sp/saml2-logout.php
+@@ -98,6 +98,31 @@ if ($message instanceof SAML2_LogoutResponse) {
+ 	$nameId = $message->getNameId();
+ 	$sessionIndexes = $message->getSessionIndexes();
+ 
++	// Get any associations these sessions have.
++	if (sspmod_saml_SP_LogoutStore::canLogoutSessions()) {
++		$associations = sspmod_saml_SP_LogoutStore::getSessionAssociations($sourceId, $nameId, $sessionIndexes);
++	} else {
++		$associations = $source->getLogoutAssociations($idpEntityId);
++	}
++
++	$isFrontChannelBinding = ($binding instanceof SAML2_HTTPPost || $binding instanceof SAML2_HTTPRedirect);
++	if (!empty($associations) && $isFrontChannelBinding) {
++		$state = array(
++			'saml:LogoutAssociations:remaining' 	=> array_keys($associations),
++			'saml:LogoutAssociations:authSource' 	=> $source,
++			'saml:LogoutAssociations:logoutRequest' => $message,
++			'saml:LogoutAssociations:spMetadata'	=> $spMetadata,
++			'saml:LogoutAssociations:idpMetadata' 	=> $idpMetadata
++		);
++
++		// Save the state
++		$id = SimpleSAML_Auth_State::saveState($state, 'saml:LogoutAssociations');
++
++		// Kick off the logging out of associations.
++		$url = SimpleSAML_Module::getModuleURL('saml/sp/saml2-logout-resume.php', array('id' => $id));
++		return SimpleSAML_Utilities::redirectTrustedURL($url);
++	}
++
+ 	$numLoggedOut = sspmod_saml_SP_LogoutStore::logoutSessions($sourceId, $nameId, $sessionIndexes);
+ 	if ($numLoggedOut === FALSE) {
+ 		/* This type of logout was unsupported. Use the old method. */
+@@ -114,6 +139,14 @@ if ($message instanceof SAML2_LogoutResponse) {
+ 		SimpleSAML_Logger::warning('Logged out of ' . $numLoggedOut  . ' of ' . count($sessionIndexes) . ' sessions.');
+ 	}
+ 
++	if (!empty($associations)) {
++		SimpleSAML_Logger::warning(
++			'Unable to log out IdP associations because a back-channel binding was used. ' .
++			'User will still be logged into SPs.'
++		);
++		$lr->setStatus(SAML2_Const::STATUS_PARTIAL_LOGOUT);
++	}
++
+ 	$dst = $idpMetadata->getEndpointPrioritizedByBinding('SingleLogoutService', array(
+ 		SAML2_Const::BINDING_HTTP_REDIRECT,
+ 		SAML2_Const::BINDING_HTTP_POST)
